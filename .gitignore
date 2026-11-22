@@ -13,3 +13,6 @@ __pycache__/
 # 导出产物（若导出到项目目录内）
 *.xlsx
 *.csv
+
+# 任务交接文档
+handover-*.md
