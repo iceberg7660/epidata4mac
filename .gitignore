@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+
+# 运行时生成的本地状态 / 数据备份（不属于仓库）
+.last.json
+*.bak
+*.draft.json
+
+# 导出产物（若导出到项目目录内）
+*.xlsx
+*.csv

@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>EpiData Mac 平替</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <div class="brand">EpiData <span>Mac 平替</span></div>
+  <div id="fileinfo"></div>
+  <nav>
+    <button data-panel="open" class="active">打开</button>
+    <button data-panel="entry" disabled>录入</button>
+    <button data-panel="browse" disabled>浏览</button>
+    <button data-panel="export" disabled>导出</button>
+  </nav>
+</header>
+
+<main>
+  <section id="panel-open" class="panel">
+    <h2>打开 EpiData 项目（通用解析任意 .rec / .qes / .chk）</h2>
+    <div class="row">
+      <button id="btn-pickdir">📁 选择文件夹…</button>
+      <button id="btn-pickrec">📄 选择 .rec 文件…</button>
+      <input id="dir-input" type="text" placeholder=".rec 所在目录路径（也可手动输入）">
+      <button id="btn-scan">扫描目录</button>
+    </div>
+    <div class="row companions">
+      <label>问卷 .qes（可选）<select id="sel-qes"></select></label>
+      <label>校验 .chk（可选）<select id="sel-chk"></select></label>
+      <span class="muted">默认自动配对同目录文件；多个 .qes/.chk 时在此手动指定</span>
+    </div>
+    <div id="rec-list"></div>
+  </section>
+
+  <section id="panel-entry" class="panel" hidden>
+    <div class="toolbar">
+      <button id="btn-prev-rec" title="查看上一份问卷">◀ 上一份</button>
+      <button id="btn-next-rec" title="查看下一份问卷">下一份 ▶</button>
+      <span id="entry-mode" class="badge"></span>
+      <button id="btn-back-entry" class="accent" hidden>↩ 回到当前正在录入的问卷</button>
+      <span id="entry-progress" class="muted"></span>
+      <span class="spacer"></span>
+      <button id="btn-new-rec">＋ 新增</button>
+      <button id="btn-del-rec" class="danger">删除</button>
+      <button id="btn-to-list">返回列表</button>
+      <button id="btn-save" class="primary">保存到 .rec (Ctrl+Enter)</button>
+    </div>
+    <div class="entry-wrap">
+      <aside id="toc"></aside>
+      <div id="qes-view" tabindex="-1"></div>
+    </div>
+    <div id="field-status">
+      <span id="fs-name">—</span>
+      <span id="fs-type"></span>
+      <span id="fs-len"></span>
+    </div>
+  </section>
+
+  <section id="panel-browse" class="panel" hidden>
+    <div class="toolbar">
+      <input id="filter" type="text" placeholder="过滤：任意字段内容">
+      <span id="browse-count" class="muted"></span>
+      <span class="spacer"></span>
+      <button id="btn-normalize" title="扫描全部记录的数值字段：去前导零、按定义小数位规范化；有问题会报告且不破坏数据">检查历史数据并规范化</button>
+      <button id="btn-new" class="primary">＋ 新建录入</button>
+    </div>
+    <div class="table-wrap">
+      <table id="rec-table" class="grid">
+        <thead><tr id="rec-head"></tr></thead>
+        <tbody id="rec-body"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="panel-export" class="panel" hidden>
+    <h2>将REC文件导出为 text 文件</h2>
+    <div class="exp-dialog">
+      <div class="exp-grid">
+        <fieldset class="exp-box">
+          <legend>选择记录</legend>
+          <label><input type="radio" name="exp-range" value="all" checked> 全部记录</label>
+          <label><input type="radio" name="exp-range" value="range"> 记录号
+            <input id="exp-from" type="number" min="1" class="num"> 至
+            <input id="exp-to" type="number" min="1" class="num"></label>
+          <label class="disabled-opt" title="本软件的删除为物理删除，.rec 中不存在已删除标记">
+            <input type="checkbox" checked disabled> 忽略已删除的记录</label>
+          <label><input type="checkbox" id="exp-usefilter"> 使用记录过滤器</label>
+          <input id="exp-filter" type="text" placeholder="如: a03=2 and z1=1" disabled>
+        </fieldset>
+        <fieldset class="exp-box">
+          <legend>选择字段</legend>
+          <div id="exp-fields"></div>
+          <div class="row">
+            <button id="btn-exp-all">全选</button>
+            <button id="btn-exp-none">不选</button>
+            <button id="btn-exp-before" title="先在列表中点选一个字段作为基准">⟨ 此字段及之前</button>
+            <button id="btn-exp-after" title="先在列表中点选一个字段作为基准">此字段及之后 ⟩</button>
+          </div>
+          <div id="exp-fieldinfo" class="muted">&nbsp;</div>
+        </fieldset>
+      </div>
+      <fieldset class="exp-box">
+        <legend>导出格式</legend>
+        <div class="exp-opts">
+          <label><input type="radio" name="exp-fmt" value="txt"> text (.txt)</label>
+          <label><input type="radio" name="exp-fmt" value="xlsx"> Excel (.xlsx)</label>
+          <label><input type="radio" name="exp-fmt" value="csv"> CSV (.csv)</label>
+        </div>
+      </fieldset>
+      <fieldset class="exp-box">
+        <legend>转成文本字段的选项</legend>
+        <div class="exp-opts">
+          <label><input type="checkbox" id="exp-quote" checked> 使用文本括号 "</label>
+          <label>字段分割符
+            <select id="exp-sep">
+              <option value=";" selected>;</option>
+              <option value=",">,</option>
+              <option value="TAB">Tab</option>
+              <option value="SP">空格</option>
+            </select></label>
+          <label><input type="checkbox" id="exp-header" checked> 在第一行书写字段名</label>
+          <label>导出编码
+            <select id="exp-enc">
+              <option value="gbk" selected>GBK（兼容 GB2312，Windows 默认）</option>
+              <option value="utf8">UTF-8</option>
+              <option value="utf8bom">UTF-8（带 BOM，Excel 友好）</option>
+            </select></label>
+        </div>
+      </fieldset>
+      <fieldset class="exp-box">
+        <legend>导出文件</legend>
+        <label class="disabled-opt" title="索引文件仅 Windows 版 EpiData 打开时使用，导出的 txt 内容不受影响">
+          <input type="checkbox" checked disabled> 使用索引</label>
+      </fieldset>
+      <div class="row">
+        <button id="btn-exp-dir">📂 选择文件夹…</button>
+        <input id="exp-name" type="text" placeholder="文件名（如 EPIDATA文件 1.txt）">
+      </div>
+      <div class="row">
+        <span id="exp-dirinfo" class="muted"></span>
+        <span class="spacer"></span>
+        <button id="btn-exp-ok" class="primary">✔ 确定（导出）</button>
+      </div>
+      <div id="exp-result" class="muted"></div>
+      <p class="muted">先选择导出格式，再点确定。选择记录 / 选择字段 / 编码对三种格式都生效；文本括号与分割符仅作用于 text。xlsx 内部为 XML 无编码问题。.rec 本身无需导出，保存时已直接写回。</p>
+    </div>
+  </section>
+</main>
+
+<div id="toast" hidden></div>
+<div id="modal-root" hidden></div>
+<script src="/static/app.js"></script>
+</body>
+</html>
