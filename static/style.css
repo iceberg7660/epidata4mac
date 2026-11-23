@@ -53,12 +53,32 @@ main { padding: 18px; max-width: 1200px; margin: 0 auto; }
 .toolbar button { color: #1e3a5f; background: #fff; border-color: #cbd5e1; }
 .spacer { flex: 1; }
 .badge { background: #dbeafe; color: #1e40af; border-radius: 999px; padding: 3px 12px; font-size: 12px; }
+
+/* 录入计时（仅内存，不写 .rec）：紧贴标题栏下方悬浮，工具栏/目录为其让位 */
+#panel-entry .toolbar { top: 104px; margin-top: 52px; }
+#timing-bar {
+  position: fixed; z-index: 20;
+  top: 54px;
+  left: max(18px, calc((100vw - 1200px) / 2 + 18px));
+  display: flex; flex-direction: column; align-items: flex-start; gap: 1px;
+  background: rgba(255,255,255,.96); border: 1px solid #cbd5e1; border-radius: 8px;
+  padding: 4px 10px; box-shadow: 0 4px 12px rgba(15,23,42,.14);
+}
+#timer-main {
+  display: flex; align-items: baseline; gap: 8px;
+  font-family: Menlo, monospace; font-size: 18px; font-weight: 700; color: #1e3a5f;
+}
+#timer-main .timer-icon { font-size: 16px; }
+#timer-main.paused #timer-value { color: #9ca3af; }
+#timer-state { font-family: "PingFang SC", sans-serif; font-size: 12px; font-weight: 400; color: #b45309; }
+#timer-avg { padding-left: 1px; }
 .badge.edit { background: #fef3c7; color: #92400e; }
 
 .entry-wrap { display: flex; gap: 14px; align-items: flex-start; }
 #toc {
-  width: 190px; flex-shrink: 0; position: sticky; top: 96px;
-  max-height: calc(100vh - 130px); overflow: auto; background: #fff;
+  /* 让开悬浮计时条与固定工具栏 */
+  width: 190px; flex-shrink: 0; position: sticky; top: 150px;
+  max-height: calc(100vh - 185px); overflow: auto; background: #fff;
   border: 1px solid #e2e8f0; border-radius: 8px; padding: 6px 0;
 }
 #toc div { padding: 4px 12px; font-size: 12px; cursor: pointer; color: #475569;

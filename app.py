@@ -4,7 +4,8 @@
   - .rec 必需（字段结构以 .rec 定义行为准，0 条记录也可）
   - .qes 可选：同目录同名优先，其次目录内唯一文件；也可手动指定。
     缺失或绑定失败时自动退化为通用平铺录入表单
-  - .chk 可选：RANGE/LEGAL/MUSTENTER/REPEAT/JUMPS/AFTER ENTRY..GOTO；
+  - .chk 可选：RANGE/LEGAL/COMMENT LEGAL/MISSINGVALUE/MUSTENTER/REPEAT/JUMPS/
+    AUTOJUMP/AFTER ENTRY 的 IF..THEN..ELSE、GOTO、LET、CLEAR；
     遇到未支持的命令会收集为警告并展示，不影响打开
 
 启动：python app.py   （Windows/macOS 均可；本机可用 启动.command 双击启动）
@@ -33,7 +34,7 @@ SETTINGS_FILE = os.path.join(BASE, '.last.json')
 sys.path.insert(0, BASE)
 from epirec import RecFile, RecError            # noqa: E402
 from epiqes import QesFile                      # noqa: E402
-from epichk import ChkFile, validate_value      # noqa: E402
+from epichk import Action, ChkFile, Condition, validate_value  # noqa: E402
 
 STATE: dict = {'rec': None, 'qes': None, 'chk': None, 'path': ''}
 
@@ -86,6 +87,138 @@ def find_companion(rec_path: str, ext: str) -> str | None:
     return others[0] if len(others) == 1 else None
 
 
+def align_rule_names(rec: RecFile, chk: ChkFile) -> None:
+    """把 .chk 规则中的字段名对齐到 .rec 的字段名（EpiData 不区分大小写）。
+    有些项目 .rec 用大写字段名、.chk 用小写，若不对齐，RANGE / MUSTENTER /
+    JUMPS 等规则会全部静默失效（原版 EpiData 两者都能识别）。"""
+    canon = {f.name.lower(): f.name for f in rec.fields}
+    order = [f.name for f in rec.fields]
+    pos = {n.lower(): i for i, n in enumerate(order)}
+
+    def fix(name: str) -> str:
+        low = name.lower()
+        if low in ('end', 'write', 'writerec', 'skipnextfield', ''):
+            return name
+        return canon.get(low, name)
+
+    def fix_actions(actions) -> None:
+        for act in actions:
+            if isinstance(act, Condition):
+                act.field = fix(act.field)
+                fix_actions(act.then_actions)
+                fix_actions(act.else_actions)
+            elif isinstance(act, Action) and act.target:
+                act.target = fix(act.target)
+
+    aligned = {}
+    for key, rule in chk.rules.items():
+        name = canon.get(key.lower(), key)
+        rule.name = name
+        rule.jumps = {v: fix(t) for v, t in rule.jumps.items()}
+        rule.gotos = [(fix(v[0]), v[1], fix(v[2])) for v in rule.gotos]
+        rule.legal_ref = fix(rule.legal_ref) if rule.legal_ref else None
+        rule.comment_ref = fix(rule.comment_ref) if rule.comment_ref else None
+        if rule.after_goto:
+            rule.after_goto = fix(rule.after_goto)
+        if rule.autojump:
+            rule.autojump = fix(rule.autojump)
+        for lr in rule.lets:
+            lr.source, lr.target = fix(lr.source), fix(lr.target)
+        rule.clears = [fix(n) for n in rule.clears]
+        fix_actions(rule.actions)
+        fix_actions(rule.before_actions)
+        aligned[name] = rule
+
+    fix_actions(chk.before_record_actions)
+    fix_actions(chk.after_record_actions)
+
+    # BEFORE FILE 的 MISSINGVALUE 字段清单/范围（如 V1-V4, V10 9）
+    for spec, vals in chk.field_missing_specs:
+        targets: list[str] = []
+        for part in spec.replace(',', ' ').split():
+            if '-' in part and part.split('-')[0].lower() in pos and part.split('-')[-1].lower() in pos:
+                a, b = part.split('-', 1)
+                targets.extend(order[pos[a.lower()]: pos[b.lower()] + 1])
+            else:
+                targets.append(canon.get(part.lower(), part))
+        for t in targets:
+            r = aligned.get(t)
+            if r:
+                r.missingvalues = list(dict.fromkeys(r.missingvalues + vals))
+                r.legal = list(dict.fromkeys(r.legal + vals))
+    chk.rules = aligned
+
+
+def attach_lookup_labels(rec_path: str, chk: ChkFile, warns: list[str]) -> None:
+    """COMMENT LEGAL 引用外部 .rec 查询表：只读加载，按 KEY 1/KEY 2 建值→标签映射。"""
+    d = os.path.dirname(rec_path)
+    for rule in chk.rules.values():
+        if not rule.comment_file:
+            continue
+        name = os.path.basename(rule.comment_file)
+        if not name.lower().endswith('.rec'):
+            name += '.rec'
+        path = os.path.join(d, name)
+        if not os.path.isfile(path):
+            warns.append(f'COMMENT LEGAL 查询表不存在: {name}')
+            continue
+        try:
+            lookup = RecFile.load(path)
+            key1 = key2 = None
+            chk_path = os.path.splitext(path)[0] + '.chk'
+            if os.path.isfile(chk_path):
+                lchk = ChkFile.load(chk_path)
+                for lr in lchk.rules.values():
+                    if lr.key_no == 1:
+                        key1 = lr.name
+                    elif lr.key_no == 2:
+                        key2 = lr.name
+            if not key1 or not key2:
+                names = [f.name for f in lookup.fields if f.width > 0]
+                key1, key2 = (names + [None, None])[:2]
+            if not key1 or not key2:
+                continue
+            labels = {}
+            for row in lookup.records:
+                lower = {k.lower(): (v or '') for k, v in row.items()}
+                value = lower.get(key1.lower(), '').strip()
+                label = lower.get(key2.lower(), '').strip()
+                if value:
+                    labels[value] = label
+            rule.lookup_labels = labels
+            rule.legal = list(dict.fromkeys(rule.legal + list(labels)))
+        except Exception as e:  # noqa: BLE001
+            warns.append(f'COMMENT LEGAL 查询表读取失败（{name}: {e}）')
+
+
+def resolve_external_labels(rec_path: str, chk_path: str | None,
+                            chk: ChkFile, warns: list[str]) -> None:
+    """COMMENT LEGAL USE 引用同目录其它 .chk 中 LABELBLOCK 的情况。"""
+    d = os.path.dirname(rec_path)
+    others = []
+    for fn in os.listdir(d):
+        if not fn.lower().endswith('.chk'):
+            continue
+        p = os.path.join(d, fn)
+        if chk_path and os.path.abspath(p) == os.path.abspath(chk_path):
+            continue
+        try:
+            others.append(ChkFile.load(p))
+        except Exception:  # noqa: BLE001
+            pass
+    for rule in chk.rules.values():
+        if not rule.comment_ref or rule.comment_legal:
+            continue
+        for other in others:
+            vals = other.label_blocks.get(rule.comment_ref)
+            if vals:
+                rule.comment_legal = list(vals)
+                rule.legal = list(dict.fromkeys(rule.legal + [v for v in vals if v]))
+                break
+        else:
+            warns.append(f'字段 {rule.name} 的 COMMENT LEGAL USE 找不到标注块 {rule.comment_ref}')
+
+
 def load_project(rec_path: str, qes_path: str | None = None,
                  chk_path: str | None = None) -> dict:
     rec = RecFile.load(rec_path)
@@ -112,6 +245,9 @@ def load_project(rec_path: str, qes_path: str | None = None,
     if chk_path:
         try:
             chk = ChkFile.load(chk_path)
+            align_rule_names(rec, chk)
+            attach_lookup_labels(rec_path, chk, warns)
+            resolve_external_labels(rec_path, chk_path, chk, warns)
         except Exception as e:  # noqa: BLE001
             warns.append(f'.chk 解析失败（{e}），校验规则不可用')
     warns.extend(chk.warnings)
@@ -131,6 +267,22 @@ def _sec_level(text: str) -> str:
     if re.match(r'^[A-Z][0-9]', t):
         return 'sub'
     return 'title'
+
+
+def _dump_actions(actions: list) -> list[dict]:
+    """把解析出的 AFTER/BEFORE ENTRY 动作序列化给前端。"""
+    out = []
+    for a in actions:
+        if isinstance(a, Condition):
+            out.append({'k': 'if', 'kind': a.kind, 'field': a.field,
+                        'op': a.op, 'value': a.value, 'value_raw': a.value_raw,
+                        'threshold': a.threshold,
+                        'then': _dump_actions(a.then_actions),
+                        'else': _dump_actions(a.else_actions)})
+        else:
+            out.append({'k': a.kind, 'target': a.target,
+                        'value': a.value, 'text': a.text})
+    return out
 
 
 def project_payload() -> dict:
@@ -159,6 +311,15 @@ def project_payload() -> dict:
             'legal': rule.legal if rule and rule.legal else [],
             'jumps': rule.jumps if rule and rule.jumps else {},
             'gotos': [list(g) for g in rule.gotos] if rule and rule.gotos else [],
+            'after_goto': (rule.after_goto or '') if rule else '',
+            'lets': [[lr.source, lr.needle, lr.target, lr.on_found, lr.on_missing]
+                     for lr in rule.lets] if rule else [],
+            'missingvalues': rule.missingvalues if rule else [],
+            'legal_labels': rule.lookup_labels if rule else {},
+            'autojump': (rule.autojump or '') if rule else '',
+            'jumps_reset': (rule.jumps_reset or '') if rule else '',
+            'actions': _dump_actions(rule.actions) if rule else [],
+            'before_actions': _dump_actions(rule.before_actions) if rule else [],
         })
     order = [f['name'] for f in fields]
     return {
@@ -171,6 +332,9 @@ def project_payload() -> dict:
         'lines': qes.segments() if qes else None,
         'records': [[rec.records[i][n] for n in order] for i in range(len(rec.records))],
         'draft': read_draft(),
+        'ignore_missing': bool(chk and chk.ignore_missing),
+        'before_record_actions': _dump_actions(chk.before_record_actions) if chk else [],
+        'after_record_actions': _dump_actions(chk.after_record_actions) if chk else [],
     }
 
 

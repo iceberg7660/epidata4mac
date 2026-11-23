@@ -27,7 +27,8 @@ DEF_PAT = re.compile(
     rb'^(?P<pre>[#_])(?P<name>[A-Za-z0-9_]+)\s+'
     rb'(?P<n1>\d+)\s+(?P<row>\d+)\s+(?P<n3>\d+)\s+(?P<col>\d+)\s+'
     rb'(?P<row2>\d+)\s+(?P<tc>\d+)\s+(?P<width>\d+)\s+112 ?')
-HEADER_PAT = re.compile(rb'^\s*(\d+)\s+(\d+)\s+VLAB\s*$')
+# 不同版本 EpiData 的文件头有 `616 1 VLAB` 与 `959 1` 两种写法，VLAB 可省略
+HEADER_PAT = re.compile(rb'^\s*(\d+)\s+(\d+)(?:\s+VLAB)?\s*$', re.IGNORECASE)
 LINE_CHUNK = 78
 
 

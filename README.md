@@ -48,12 +48,23 @@ macOS 用户也可双击 `启动.command`（内含本机 conda 环境路径，�
   - 整数字段自动去前导零：`0012345678` → `12345678`、`00` → `0`；
   - 日期字段输入 `20240115` 自动变为 `2024/01/15`。
 - **实时校验**：范围、合法值、必填、日期与数值格式不符时**立即弹窗拦截**
+  （RANGE 与 LEGAL 同时出现时，LEGAL 是范围外的附加合法码，如 `RANGE 1 2` + `LEGAL 9`
+  表示 1、2、9 都合法；只有 LEGAL 时才是穷举白名单）
   （必填空着离开当场拦截；被跳转合法跳过的必填允许留空，与 EpiData 语义一致）。
 - **回溯即修改**：方向键回到已填格子时内容自动全选，直接打字即覆盖。
 - **记录导航**：工具栏 ◀ 上一份 / 下一份 ▶ / ＋ 新增 / 删除（删除前生成完整
   备份 `.deleted-*.bak`），查看其他问卷不影响正在录入的草稿，
   「↩ 回到当前正在录入的问卷」一键回原位续录。
 - **底部状态栏**：实时显示当前格子的字段名、类型与范围、存储长度。
+- **自动赋值**：`.chk` 的 AFTER ENTRY 里 `IF pos("1",a04) <>0 THEN LET a04q1=1 ELSE …`
+  这类规则在确认字段时自动填好目标字段（如 A04 录 `234` → A04Q1-6 自动填 `2/1/1/1/2/2`），
+  随后按裸 GOTO 跳到指定字段。
+- **录入计时**：录入页左上角悬浮显示当前这份问卷的有效用时（新问卷从 00:00 起）；
+  录入页内任意操作（打字、按键、点击、滚动）都会重置 5 秒空闲窗口，无操作 5 秒
+  自动暂停并显示「已暂停」，再操作即继续；切到其它面板、打开弹窗、查看历史记录
+  时暂停。下方「平均录入时间」= 本次会话累计有效录入时间 ÷ 当前 .rec 记录数
+  （含历史记录，打开即有值），换 .rec 文件重新统计。计时仅存于内存，**不写入 .rec**，
+  刷新页面后清零。
 
 ### 3. 草稿与保存
 
@@ -91,6 +102,9 @@ macOS 用户也可双击 `启动.command`（内含本机 conda 环境路径，�
 
 - 写回的 .rec 保持原格式（GBK 编码、CRLF、`!` 行终止符、78 字符断行），
   Windows EpiData 可直接打开与合并。
+- 文件头兼容 `616 1 VLAB` 和 `959 1`（省略 VLAB）两种写法；.rec 与 .chk
+  字段名大小写不一致时（如 .rec 全大写、.chk 全小写）自动按 .rec 名字对齐，
+  校验规则与跳转不会失效。
 - 数值字段按 EpiData 原版行为规范化存储（整数字段去前导零、浮点字段按定义
   小数位补齐），导出结果与原版 EpiData 导出逐列一致。
 
@@ -127,8 +141,17 @@ test_export 支持两个可选环境变量：`EPIDATA_REF_TXT`（原版 EpiData 
 
 ## 已知限制
 
-- .chk 仅支持 RANGE / LEGAL / MUSTENTER / REPEAT / JUMPS / AFTER ENTRY..GOTO；
-  其它命令（HELP、CONFIRM 等）会收集为警告展示，不影响打开与保存。
+- .chk 支持：RANGE（含 `-INF`/`INF` 与日期区间）、LEGAL（逗号/区间写法、
+  `LEGAL USE 字段`）、COMMENT LEGAL（块、`USE 字段` / `USE 标注块`）、
+  MISSINGVALUE（字段级、`MISSINGVALUE ALL`、字段清单）、MUSTENTER、REPEAT、
+  JUMPS（含 `JUMPS RESET`、`SKIPNEXTFIELD` / `WRITE`）、AUTOJUMP、
+  BEFORE/AFTER ENTRY 的 IF..THEN..ELSE、GOTO、LET、CLEAR、CHECK、HELP；
+  BEFORE RECORD 的 LET / CLEAR，AFTER RECORD 的 LET / CHECK / GOTO（阻止保存）；
+  COMMENT LEGAL 引用外部
+  .rec 查询表（按 KEY 1 / KEY 2 读取值→标签）；表达式与常用函数（算术、比较、
+  逻辑、字符串、日期、`TODAY`、`Sum/CountMissing` 等，`IGNOREMISSING` 也生效）。
+  仅 RELATE / BACKUP / EXECUTE / LOAD 等桌面集成与 UDF（DLL）命令不执行，
+  会列入警告，不影响打开与录入。
 - 不支持从 .qes 新建空 .rec（打开已有 .rec 即可，0 条记录也行）。
 - 双录入核对未实现（按需求暂缓）。
 - 文件夹与文件选择对话框依赖 macOS osascript；其它系统请手动输入路径。

@@ -139,6 +139,70 @@ function alertMsg(title, html, refocusInput) {
     });
 }
 
+/* ---------------- 录入计时（纯内存，不写入 .rec） ----------------
+ * 当前用时：仅「正在录入草稿 + 停留在录入页 + 无弹窗」时按真实经过时间累加；
+ * 无操作 5 秒 / 切面板 / 查看历史记录 / 弹窗 → 暂停，有操作或回到录入页后继续；
+ * 平均录入时间 = 本次会话累计有效用时 ÷ 当前 .rec 记录总数（含历史记录）。
+ */
+const IDLE_MS = 5000;
+const timing = {
+  path: null, currentMs: 0, sessionMs: 0,
+  lastTs: performance.now(), idle: false, idleTimer: null,
+};
+
+function fmtDur(ms) {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  const pad = n => String(n).padStart(2, '0');
+  const h = Math.floor(s / 3600);
+  return h ? `${pad(h)}:${pad(Math.floor(s / 60) % 60)}:${pad(s % 60)}`
+           : `${pad(Math.floor(s / 60))}:${pad(s % 60)}`;
+}
+function timingActive() {
+  return !!P && entry.active && viewing === null && !modalOpen &&
+         !document.hidden && !$('#panel-entry').hidden;
+}
+function renderTiming() {
+  const active = timingActive() && !timing.idle;
+  $('#timer-value').textContent = fmtDur(timing.currentMs);
+  $('#timer-state').textContent = !timingActive() ? '已暂停' : (timing.idle ? '已暂停（5 秒无操作）' : '');
+  $('#timer-main').classList.toggle('paused', !active);
+  const n = P ? P.records.length : 0;
+  $('#timer-avg').textContent = n
+    ? `平均录入时间 ${fmtDur(timing.sessionMs / n)} / 份（本文件 ${n} 份记录）`
+    : '平均录入时间 — / 份（本文件暂无记录）';
+}
+function noteActivity() {
+  if (!timingActive()) return;
+  timing.idle = false;
+  clearTimeout(timing.idleTimer);
+  timing.idleTimer = setTimeout(() => { timing.idle = true; renderTiming(); }, IDLE_MS);
+  renderTiming();
+}
+function resetCurrentTiming() {
+  timing.currentMs = 0;
+  noteActivity();
+}
+function resetTimingForRec(path) {
+  timing.path = path;
+  timing.currentMs = 0;
+  timing.sessionMs = 0;
+  timing.idle = false;
+  clearTimeout(timing.idleTimer);
+  renderTiming();
+}
+// 录入页内任意交互都算「有操作」：打字、按键、点击、滚动
+['keydown', 'input', 'pointerdown', 'wheel', 'scroll'].forEach(evt =>
+  document.addEventListener(evt, noteActivity, true));
+setInterval(() => {
+  const now = performance.now();
+  if (timingActive() && !timing.idle) {
+    timing.currentMs += now - timing.lastTs;
+    timing.sessionMs += now - timing.lastTs;
+  }
+  timing.lastTs = now;
+  renderTiming();
+}, 250);
+
 /* ---------------- 面板切换 ---------------- */
 
 function showPanel(name) {
@@ -156,6 +220,8 @@ function showPanel(name) {
     $('#exp-to').max = P.records.length;
     $('#exp-to').value = P.records.length;
   }
+  // 回到录入页视为一次新操作：解除空闲暂停，重新开始 5 秒窗口
+  if (name === 'entry') noteActivity();
 }
 
 $$('nav button').forEach(b => {
@@ -222,6 +288,11 @@ async function openRec(path) {
   try {
     P = await api('/api/open', body);
   } catch (e) { toast(e.message, true); return; }
+  chkIgnoreMissing = !!P.ignore_missing;
+  chkVars = {};
+  chkEvalErrors.clear();
+  chkReportedCount = 0;
+  resetTimingForRec(P.path);          // 换 .rec 文件：计时与累计都清零
 
   fieldsByName = {}; inputs = {};
   P.fields.forEach(f => { fieldsByName[f.name] = f; });
@@ -259,6 +330,7 @@ function makeInput(f) {
   inp.addEventListener('input', () => {
     clampBytes(inp, f.width);
     inp.classList.toggle('filled', !!inp.value.trim());
+    updateFieldStatus(f);
     // 输满自动跳格（按字段宽度；触发与 Enter 相同的校验+跳转逻辑）
     if (gbkLen(inp.value) >= f.width && document.activeElement === inp && !modalOpen) {
       advance(f.name);
@@ -286,6 +358,8 @@ function updateFieldStatus(f) {
     type = f.rng ? `数值: ${f.rng[0]} ~ ${f.rng[1]}` : '数值';
     if (f.decimals > 0) type += `，保留 ${f.decimals} 位小数`;
   } else type = '文本';
+  const cur = inputs[f.name] ? inputs[f.name].value.trim() : '';
+  if (f.legal_labels && cur && f.legal_labels[cur]) type += ` · ${f.legal_labels[cur]}`;
   $('#fs-type').textContent = type;
   $('#fs-len').textContent = `长度: ${f.width}`;
 }
@@ -377,7 +451,7 @@ function renderToc() {
 
 /* 滚动定位时预留顶部固定栏（标题栏+工具栏）的高度，避免目标被盖住/滑过头 */
 function scrollWithOffset(el) {
-  const OFFSET = 106;
+  const OFFSET = 155;   // 标题栏 + 悬浮计时条 + 固定工具栏的高度
   const y = el.getBoundingClientRect().top + window.scrollY - OFFSET;
   window.scrollTo({top: Math.max(0, y), behavior: 'smooth'});
 }
@@ -392,28 +466,58 @@ function markToc(name) {
 
 const NUM_RE = /^-?\d+(\.\d+)?$/;
 
+/* RANGE 支持 -INF / INF 与 dd/mm/yyyy 日期区间（EpiData 官方文档） */
+function chkNum(s) {
+  const t = String(s).trim().toUpperCase();
+  if (t === 'INF' || t === 'INFINITY') return Infinity;
+  if (t === '-INF' || t === '-INFINITY') return -Infinity;
+  return Number(s);
+}
+function chkDateKey(s) {
+  const m = String(s).trim().match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})$/);
+  if (!m) return null;
+  let y = +m[3];
+  if (y < 100) y += y < 50 ? 2000 : 1900;
+  return y * 10000 + (+m[2]) * 100 + (+m[1]);
+}
+
 function clientValidate(f, raw) {
   const v = (raw || '').trim();
   if (!v) return null;                     // 空值由必填当场拦截 / 跳转语义决定
   if (f.tc === 19) {
+    if (f.legal.includes(v)) return null;   // 日期字段的 LEGAL / 缺失码
     const m = v.match(/^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})$/);
     if (!m) return '日期格式应为 yyyy/mm/dd';
     const d = new Date(+m[1], +m[2] - 1, +m[3]);
     if (d.getMonth() !== +m[2] - 1 || d.getDate() !== +m[3]) return '日期不存在';
+    if (f.rng) {
+      const key = chkDateKey(v), lo = chkDateKey(f.rng[0]), hi = chkDateKey(f.rng[1]);
+      if (key !== null && lo !== null && hi !== null && (key < lo || key > hi))
+        return `超出日期范围 ${f.rng[0]} ~ ${f.rng[1]}`;
+    }
     return null;
   }
-  if (f.legal.length && !f.legal.includes(v)) return `合法值仅为: ${f.legal.join(' / ')}`;
+  // RANGE + LEGAL 同时存在时，LEGAL 是范围外的附加合法码（如 A03 的 9 = 不适用），
+  // 不是「只能取 LEGAL 里的值」；只有 LEGAL 没有 RANGE 时才是穷举白名单。
+  const legalOk = f.legal.length > 0 && f.legal.includes(v);
+  if (f.legal.length && !f.rng && !legalOk) return `合法值仅为: ${f.legal.join(' / ')}`;
   if (f.kind === '#') {
-    if (!NUM_RE.test(v)) return `数值字段，${v} 不是有效数字`;
-    if (f.decimals === 0 && v.includes('.')) return '整数字段，不能包含小数点';
-    if (f.decimals > 0) {
-      const fr = (v.split('.')[1] || '');
-      if (fr.length > f.decimals) return `最多保留 ${f.decimals} 位小数`;
+    if (!NUM_RE.test(v) && !legalOk) return `数值字段，${v} 不是有效数字`;
+    if (!legalOk) {
+      if (f.decimals === 0 && v.includes('.')) return '整数字段，不能包含小数点';
+      if (f.decimals > 0) {
+        const fr = (v.split('.')[1] || '');
+        if (fr.length > f.decimals) return `最多保留 ${f.decimals} 位小数`;
+      }
     }
-    if (f.rng) {
-      const nv = +v, lo = +f.rng[0], hi = +f.rng[1];
-      if (!Number.isNaN(lo) && !Number.isNaN(hi) && (nv < lo || nv > hi))
-        return `超出范围 ${f.rng[0]} ~ ${f.rng[1]}`;
+    if (f.rng && !legalOk) {
+      const nv = chkNum(v, false), lo = chkNum(f.rng[0], false), hi = chkNum(f.rng[1], false);
+      if (typeof nv !== 'number' || Number.isNaN(nv)) return `数值字段，${v} 不是有效数字`;
+      const bad = typeof lo === 'number' && typeof hi === 'number' &&
+                  !Number.isNaN(lo) && !Number.isNaN(hi) && (nv < lo || nv > hi);
+      if (bad)
+        return `超出范围 ${f.rng[0]} ~ ${f.rng[1]}` +
+               (f.legal.length ? `（合法附加码：${f.legal.join(' / ')}）` : '');
     }
   }
   return null;
@@ -470,6 +574,467 @@ function padDecimals(v, dec) {
   return ip + '.' + fr;
 }
 
+/* AFTER ENTRY 的 pos() 条件赋值：按来源字段内容自动填充目标字段（同原版 EpiData） */
+function applyAfterEntryLets(name) {
+  const f = fieldsByName[name];
+  if (!f || !f.lets || !f.lets.length) return;
+  for (const [srcName, needle, target, onFound, onMissing] of f.lets) {
+    const src = inputs[srcName], inp = inputs[target];
+    if (!src || !inp) continue;
+    inp.value = src.value.includes(needle) ? onFound : onMissing;
+    inp.classList.toggle('filled', !!inp.value.trim());
+    clearBad(inp);
+  }
+}
+
+/* ---- EpiData CHECK 表达式求值（官方运算符与常用函数） ------------------- */
+const CHK_MISSING = Symbol('chk-missing');
+let chkIgnoreMissing = false;
+let chkVars = {};
+const chkEvalErrors = new Set();     // 解析失败的 CHECK 表达式（去重后提示）
+let chkReportedCount = 0;
+let chkEntryCheckError = '';         // AFTER ENTRY 中 CHECK 未通过的提示
+
+function chkIsNumString(s) {
+  const t = String(s).trim();
+  return t !== '' && !Number.isNaN(Number(t)) && chkDateKey(t) === null;
+}
+function chkDateNum(y, mo, d) {
+  return Math.floor((Date.UTC(y, mo - 1, d) - Date.UTC(1899, 11, 31)) / 86400000) + 1;
+}
+function chkNumToDate(n) {
+  const dt = new Date(Date.UTC(1899, 11, 31) + (Math.floor(n) - 1) * 86400000);
+  const p = x => String(x).padStart(2, '0');
+  return `${p(dt.getUTCDate())}/${p(dt.getUTCMonth() + 1)}/${dt.getUTCFullYear()}`;
+}
+function chkTodayNum() {
+  const d = new Date();
+  return chkDateNum(d.getFullYear(), d.getMonth() + 1, d.getDate());
+}
+function chkToNum(v, ignore) {
+  if (v === CHK_MISSING || v === undefined || v === null) return ignore ? 0 : CHK_MISSING;
+  if (typeof v === 'number') return v;
+  if (typeof v === 'boolean') return v ? 1 : 0;
+  const s = String(v).trim();
+  const k = chkDateKey(s);
+  if (k !== null) return chkDateNum(Math.floor(k / 10000), Math.floor(k / 100) % 100, k % 100);
+  const n = Number(s);
+  return Number.isNaN(n) ? (ignore ? 0 : CHK_MISSING) : n;
+}
+function chkNum(v, ignore) {
+  const flag = ignore === undefined ? chkIgnoreMissing : ignore;
+  const x = chkToNum(v, flag);
+  return x === CHK_MISSING ? (flag ? 0 : CHK_MISSING) : x;
+}
+function chkTruth(v) {
+  if (v === CHK_MISSING || v === undefined || v === null) return false;
+  if (typeof v === 'number') return v !== 0;
+  if (typeof v === 'boolean') return v;
+  return !['', 'N', 'F', 'NO', 'FALSE', '0'].includes(String(v).trim().toUpperCase());
+}
+function chkArith(op, a, b) {
+  if ((a === CHK_MISSING || b === CHK_MISSING) && !chkIgnoreMissing) return CHK_MISSING;
+  const astr = typeof a === 'string' && !chkIsNumString(a) && chkDateKey(a) === null;
+  const bstr = typeof b === 'string' && !chkIsNumString(b) && chkDateKey(b) === null;
+  if (op === '+' && (astr || bstr)) return String(a === CHK_MISSING ? '' : a) +
+                                        String(b === CHK_MISSING ? '' : b);
+  const an = chkNum(a), bn = chkNum(b);
+  if (typeof an !== 'number' || typeof bn !== 'number') return CHK_MISSING;
+  switch (op) {
+    case '+': return an + bn;
+    case '-': return an - bn;
+    case '*': return an * bn;
+    case '/': return bn === 0 ? CHK_MISSING : an / bn;
+    case 'div': return bn === 0 ? CHK_MISSING : Math.trunc(an / bn);
+    case 'mod': return bn === 0 ? CHK_MISSING : an % bn;
+    case '^': return Math.pow(an, bn);
+    default: return CHK_MISSING;
+  }
+}
+function chkCompare(a, op, b) {
+  if (a === CHK_MISSING || b === CHK_MISSING) {
+    if (op === '=') return a === b;
+    if (op === '<>') return a !== b;
+    return false;
+  }
+  const an = chkToNum(a), bn = chkToNum(b);
+  const numeric = an !== CHK_MISSING && bn !== CHK_MISSING &&
+    (typeof a !== 'string' || chkIsNumString(a) || chkDateKey(a) !== null) &&
+    (typeof b !== 'string' || chkIsNumString(b) || chkDateKey(b) !== null);
+  const x = numeric ? [an, bn] : [String(a).toLowerCase(), String(b).toLowerCase()];
+  switch (op) {
+    case '=': return x[0] === x[1];
+    case '<>': return x[0] !== x[1];
+    case '<': return x[0] < x[1];
+    case '>': return x[0] > x[1];
+    case '<=': return x[0] <= x[1];
+    case '>=': return x[0] >= x[1];
+    default: return false;
+  }
+}
+function chkFieldValue(name) {
+  if (inputs[name]) {
+    const s = inputs[name].value.trim();
+    return s === '' ? CHK_MISSING : s;
+  }
+  return Object.prototype.hasOwnProperty.call(chkVars, name) ? chkVars[name] : CHK_MISSING;
+}
+function chkDateParts(v) {
+  const n = chkNum(v, false);
+  if (typeof n !== 'number' || !Number.isFinite(n)) return null;
+  const dt = new Date(Date.UTC(1899, 11, 31) + (Math.floor(n) - 1) * 86400000);
+  const w = dt.getUTCDay();
+  return {y: dt.getUTCFullYear(), m: dt.getUTCMonth() + 1, d: dt.getUTCDate(),
+          w: w === 0 ? 7 : w};
+}
+function chkExpandArgs(args) {
+  const out = [];
+  for (const a of args) {
+    if (typeof a === 'string' && a.includes('-')) {
+      const [s, e] = a.split('-');
+      const i = order.indexOf(s), j = order.indexOf(e);
+      if (i >= 0 && j >= 0) {
+        for (let k = i; k <= j; k++) out.push(chkFieldValue(order[k]));
+        continue;
+      }
+    }
+    out.push(a);
+  }
+  return out;
+}
+function chkCall(name, args) {
+  const one = () => chkNum(args[0], false);
+  const str = () => args[0] === CHK_MISSING || args[0] === undefined ? '' : String(args[0]);
+  switch (name) {
+    case 'ABS': { const n = one(); return n === CHK_MISSING ? n : Math.abs(n); }
+    case 'SQR': { const n = one(); return n === CHK_MISSING ? n : n * n; }
+    case 'SQRT': { const n = one(); return n === CHK_MISSING ? n : Math.sqrt(n); }
+    case 'SIN': return Math.sin(one());
+    case 'COS': return Math.cos(one());
+    case 'TAN': return Math.tan(one());
+    case 'ARCTAN': return Math.atan(one());
+    case 'EXP': return Math.exp(one());
+    case 'LN': return Math.log(one());
+    case 'LOG10': return Math.log10(one());
+    case 'INT': { const n = one(); return n === CHK_MISSING ? n : Math.trunc(n); }
+    case 'INTEGER': { const n = parseInt(str(), 10); return Number.isNaN(n) ? CHK_MISSING : n; }
+    case 'ROUND': { const n = one(); return n === CHK_MISSING ? n : Math.sign(n) * Math.round(Math.abs(n)); }
+    case 'TRUNC': { const n = one(); return n === CHK_MISSING ? n : Math.trunc(n); }
+    case 'FLOAT': return one();
+    case 'FRAC': { const n = one(); return n === CHK_MISSING ? n : n - Math.trunc(n); }
+    case 'POWER': return Math.pow(chkNum(args[0], false), chkNum(args[1], false));
+    case 'PI': return Math.PI;
+    case 'STRING': return str();
+    case 'UPPER': return str().toUpperCase();
+    case 'LOWER': return str().toLowerCase();
+    case 'LENGTH': return str().length;
+    case 'COPY': {
+      const s = str(), i = chkNum(args[1], false), c = chkNum(args[2], false);
+      return s.substr(Math.max(0, (i || 1) - 1), c || 0);
+    }
+    case 'POS': return String(args[1] === undefined ? '' : args[1]).toLowerCase()
+                      .indexOf(str().toLowerCase()) + 1;   // 未找到返回 0
+    case 'DATE': return chkDateNum(chkNum(args[2], false), chkNum(args[1], false), chkNum(args[0], false));
+    case 'DAY': { const p = chkDateParts(args[0]); return p ? p.d : CHK_MISSING; }
+    case 'MONTH': { const p = chkDateParts(args[0]); return p ? p.m : CHK_MISSING; }
+    case 'YEAR': { const p = chkDateParts(args[0]); return p ? p.y : CHK_MISSING; }
+    case 'DAYOFWEEK': { const p = chkDateParts(args[0]); return p ? p.w : CHK_MISSING; }
+    case 'WEEKNUM': {
+      const p = chkDateParts(args[0]);
+      if (!p) return CHK_MISSING;
+      const start = new Date(Date.UTC(p.y, 0, 1));
+      return Math.floor((Date.UTC(p.y, p.m - 1, p.d) - start.getTime()) / 604800000) + 1;
+    }
+    case 'TODAY': return chkTodayNum();
+    case 'NOW': {
+      const d = new Date();
+      return chkTodayNum() + (d.getHours() * 60 + d.getMinutes()) / 1440;
+    }
+    case 'TIME2NUM': { const n = one(); return n === CHK_MISSING ? n : (n % 24) / 24; }
+    case 'NUM2TIME': { const n = one(); return n === CHK_MISSING ? n : Math.round((n % 1) * 100); }
+    case 'RANGE': {
+      const a = chkNum(args[0], false), lo = chkNum(args[1], false), hi = chkNum(args[2], false);
+      return a >= lo && a <= hi;
+    }
+    case 'SUM': case 'MEAN': case 'MIN': case 'MAX': case 'COUNTMISSING': {
+      const vals = chkExpandArgs(args);
+      if (name === 'COUNTMISSING') return vals.filter(v => v === CHK_MISSING).length;
+      const nums = vals.map(v => chkNum(v, false)).filter(v => typeof v === 'number');
+      if (!nums.length) return CHK_MISSING;
+      if (name === 'SUM') return nums.reduce((a, b) => a + b, 0);
+      if (name === 'MEAN') return nums.reduce((a, b) => a + b, 0) / nums.length;
+      return name === 'MIN' ? Math.min(...nums) : Math.max(...nums);
+    }
+    default: return CHK_MISSING;
+  }
+}
+function chkTokenize(src) {
+  const out = [];
+  const s = String(src);
+  let i = 0;
+  while (i < s.length) {
+    const c = s[i];
+    if (/\s/.test(c)) { i++; continue; }
+    if (c === '*' && s[i + 1] === '*') break;
+    if (/[0-9]/.test(c) || (c === '.' && /[0-9]/.test(s[i + 1] || ''))) {
+      let j = i;
+      while (j < s.length && /[0-9.]/.test(s[j])) j++;
+      out.push({t: 'num', v: Number(s.slice(i, j))});
+      i = j; continue;
+    }
+    if (c === '"' || c === "'") {
+      let j = i + 1, buf = '';
+      while (j < s.length && s[j] !== c) {
+        if (s[j] === '\\' && j + 1 < s.length) { buf += s[j + 1]; j += 2; }
+        else buf += s[j++];
+      }
+      out.push({t: 'str', v: buf});
+      i = j + 1; continue;
+    }
+    if (/[A-Za-z_]/.test(c)) {
+      let j = i;
+      while (j < s.length && /[A-Za-z0-9_]/.test(s[j])) j++;
+      out.push({t: 'id', v: s.slice(i, j)});
+      i = j; continue;
+    }
+    const two = s.slice(i, i + 2);
+    if (['<>', '!=', '<=', '>='].includes(two)) { out.push({t: 'op', v: two}); i += 2; continue; }
+    if ('+-*/^=()<>,.@'.includes(c)) { out.push({t: 'op', v: c}); i++; continue; }
+    throw new Error('未知字符 ' + c);
+  }
+  return out;
+}
+class ChkExpr {
+  constructor(src) { this.toks = chkTokenize(src); this.i = 0; }
+  peek() { return this.toks[this.i]; }
+  eat(v) {
+    const t = this.peek();
+    if (!t) return false;
+    const same = t.t === 'id' ? t.v.toLowerCase() === String(v).toLowerCase() : t.v === v;
+    if (same) { this.i++; return true; }
+    return false;
+  }
+  expect(v) { if (!this.eat(v)) throw new Error('缺少 ' + v); }
+  parse() { const v = this.or(); if (this.i < this.toks.length) throw new Error('多余字符'); return v; }
+  or() { let a = this.xor(); while (this.eat('or')) { const b = this.xor(); a = chkTruth(a) || chkTruth(b); } return a; }
+  xor() { let a = this.and(); while (this.eat('xor')) { const b = this.and(); a = chkTruth(a) !== chkTruth(b); } return a; }
+  and() { let a = this.not(); while (this.eat('and')) { const b = this.not(); a = chkTruth(a) && chkTruth(b); } return a; }
+  not() { if (this.eat('not')) return !chkTruth(this.not()); return this.cmp(); }
+  cmp() {
+    let a = this.add();
+    const ops = ['=', '<>', '!=', '<=', '>=', '<', '>'];
+    while (ops.some(o => this.eat(o))) {
+      const op = this.toks[this.i - 1].v;
+      a = chkCompare(a, op === '!=' ? '<>' : op, this.add());
+    }
+    return a;
+  }
+  add() {
+    let a = this.mul();
+    while (this.eat('+') || this.eat('-')) {
+      const op = this.toks[this.i - 1].v;
+      a = chkArith(op, a, this.mul());
+    }
+    return a;
+  }
+  mul() {
+    let a = this.unary();
+    while (this.eat('*') || this.eat('/') || this.eat('div') || this.eat('mod')) {
+      const op = this.toks[this.i - 1].v;
+      a = chkArith(op, a, this.unary());
+    }
+    return a;
+  }
+  unary() {
+    if (this.eat('-')) { const v = chkNum(this.unary(), false); return typeof v === 'number' ? -v : v; }
+    if (this.eat('+')) return this.unary();
+    return this.pow();
+  }
+  pow() {
+    const a = this.primary();
+    if (this.eat('^')) {
+      const b = chkNum(this.pow(), false);
+      const n = chkNum(a, false);
+      return typeof n === 'number' && typeof b === 'number' ? Math.pow(n, b) : CHK_MISSING;
+    }
+    return a;
+  }
+  primary() {
+    const t = this.peek();
+    if (!t) throw new Error('表达式不完整');
+    if (this.eat('(')) { const v = this.or(); this.expect(')'); return v; }
+    if (t.t === 'num') { this.i++; return t.v; }
+    if (t.t === 'str') { this.i++; return t.v; }
+    if (this.eat('.')) return CHK_MISSING;
+    if (this.eat('@')) {
+      const id = this.peek();
+      if (!id || id.t !== 'id') throw new Error('@ 后应为字段名');
+      this.i++;
+      return inputs[id.v] ? inputs[id.v].value.trim() : '';
+    }
+    if (t.t === 'id') {
+      this.i++;
+      const up = t.v.toUpperCase();
+      if (this.eat('(')) {
+        const args = [];
+        if (!this.eat(')')) {
+          do { args.push(this.or()); } while (this.eat(','));
+          this.expect(')');
+        }
+        return chkCall(up, args);
+      }
+      if (up === 'PI') return Math.PI;
+      if (up === 'TRUE') return true;
+      if (up === 'FALSE') return false;
+      if (up === 'TODAY') return chkTodayNum();
+      if (up === 'NOW') return chkCall('NOW', []);
+      return chkFieldValue(t.v);
+    }
+    throw new Error('无法解析 ' + t.v);
+  }
+}
+function chkEval(src) {
+  try { return new ChkExpr(src).parse(); }
+  catch (e) {
+    chkEvalErrors.add(`${String(src).slice(0, 50)} → ${e.message}`);
+    return undefined;                  // 调用方回退，但错误会被提示，不静默失效
+  }
+}
+function chkReportEvalErrors() {
+  if (chkEvalErrors.size <= chkReportedCount) return;
+  chkReportedCount = chkEvalErrors.size;
+  toast('部分 CHECK 表达式未能解析：' + [...chkEvalErrors][0], true, 6000);
+}
+
+/* ---- 通用 .chk AFTER ENTRY 动作执行：IF/ELSE、GOTO、LET、CLEAR、HELP ---- */
+function chkResolveValue(raw, target) {
+  const s = String(raw == null ? '' : raw);
+  if (!s) return '';
+  const v = chkEval(s);
+  if (v === undefined) return s === '.' ? '' : s;   // 表达式解析失败：按字面量处理
+  if (v === CHK_MISSING) return '';
+  if (typeof v === 'boolean') return v ? 'Y' : 'N';
+  const tf = target && fieldsByName[target];
+  if (typeof v === 'number' && tf && tf.tc === 19) return chkNumToDate(v);
+  return String(v);
+}
+/* 区分字面量与字段/表达式：未加引号的 F、N 等应作为字符串字面量 */
+function chkCondRhs(c) {
+  const t = String(c.value_raw || c.value || '').trim();
+  const quoted = t.length >= 2 && ((t[0] === '"' && t.at(-1) === '"') ||
+                                   (t[0] === "'" && t.at(-1) === "'"));
+  const ident = /^[A-Za-z_][A-Za-z0-9_]*$/.test(t);
+  const known = quoted || /^-?\d+(\.\d+)?$/.test(t) || t === '.' ||
+    /^(TODAY|NOW|TRUE|FALSE|PI)$/i.test(t) ||
+    (ident && (inputs[t] || Object.prototype.hasOwnProperty.call(chkVars, t))) ||
+    /[()@+\-*/^<>=]/.test(t) || t.includes(' ');
+  return known ? t : JSON.stringify(t);
+}
+function chkCondTrue(c) {
+  const kind = c.k === 'if' ? c.kind : c.k;
+  if (kind === 'pos') {
+    const s = inputs[c.field] ? inputs[c.field].value.toLowerCase() : '';
+    const p = s.indexOf(String(c.value).toLowerCase()) + 1;   // pos 未找到返回 0
+    const t = Number(c.threshold === undefined ? 0 : c.threshold);
+    switch (c.op) {
+      case '=': return p === t;
+      case '<>': return p !== t;
+      case '>': return p > t;
+      case '>=': return p >= t;
+      case '<': return p < t;
+      case '<=': return p <= t;
+      default: return p !== 0;
+    }
+  }
+  if (kind === 'cmp') {
+    const v = chkEval(`${c.field} ${c.op} ${chkCondRhs(c)}`);
+    if (v !== undefined) return chkTruth(v);
+    // 表达式解析失败时的简单回退
+    const left = inputs[c.field] ? inputs[c.field].value.trim() : '';
+    const right = chkResolveValue(c.value);
+    return chkCompare(left, c.op, right);
+  }
+  if (kind === 'expr') {
+    const v = chkEval(c.value);
+    return v === undefined ? false : chkTruth(v);
+  }
+  return false;
+}
+function runChkActions(actions, owner) {
+  let gotoTarget = null;
+  (actions || []).forEach(a => {
+    if (a.k === 'if') {
+      const g = runChkActions(chkCondTrue(a) ? a.then : a.else, owner);
+      if (g !== null) gotoTarget = g;
+    } else if (a.k === 'goto') {
+      gotoTarget = a.target || owner;
+    } else if (a.k === 'clear') {
+      const n = a.target || owner;
+      if (inputs[n]) {
+        inputs[n].value = '';
+        inputs[n].classList.remove('filled');
+        clearBad(inputs[n]);
+      }
+    } else if (a.k === 'let') {
+      const inp = inputs[a.target];
+      if (inp) {
+        inp.value = chkResolveValue(a.value, a.target);
+        inp.classList.toggle('filled', !!inp.value.trim());
+        clearBad(inp);
+      } else {
+        chkVars[a.target] = chkEval(a.value);
+      }
+    } else if (a.k === 'check') {
+      if (!chkTruth(chkEval(a.value)) && !chkEntryCheckError)
+        chkEntryCheckError = a.text || 'CHECK 校验未通过';
+    } else if (a.k === 'help') {
+      toast(a.text, false, 5000);
+    }
+  });
+  return gotoTarget;
+}
+/* AFTER RECORD：CHECK 表达式失败或 GOTO 都会阻止保存（同原版 EpiData） */
+function runRecordActions(actions) {
+  const res = {goto: null, failed: false, message: ''};
+  (actions || []).forEach(a => {
+    if (a.k === 'if') {
+      const sub = runRecordActions(chkCondTrue(a) ? a.then : a.else);
+      if (sub.goto !== null) res.goto = sub.goto;
+      if (sub.failed && !res.failed) { res.failed = true; res.message = sub.message; }
+    } else if (a.k === 'check') {
+      if (!chkTruth(chkEval(a.value)) && !res.failed) {
+        res.failed = true;
+        res.message = a.text;
+      }
+    } else if (a.k === 'goto') {
+      res.goto = a.target;
+    } else if (a.k === 'help' || a.k === 'type') {
+      if (a.text) toast(a.text, false, 5000);
+    } else if (a.k === 'let' || a.k === 'clear') {
+      runChkActions([a], order[0]);
+    }
+  });
+  return res;
+}
+function chkTargetIndex(t, i) {
+  const k = String(t || '').toLowerCase();
+  if (k === '' ) return i;                       // GOTO 无参数 = 当前字段
+  if (k === 'end') return order.length - 1;
+  if (k === 'skipnextfield') return Math.min(i + 2, order.length - 1);
+  if (k === 'write' || k === 'writerec') return -2;
+  return order.indexOf(t);
+}
+/* JUMPS RESET：把跳过的字段按宽度填成指定字符（日期字段除外） */
+function applyJumpReset(from, to, fill) {
+  if (!fill || to <= from + 1) return;
+  for (let k = from + 1; k < to; k++) {
+    const fld = fieldsByName[order[k]], inp = inputs[order[k]];
+    if (!fld || !inp || fld.tc === 19) continue;
+    inp.value = String(fill).repeat(fld.width || 1).slice(0, fld.width || 1);
+    inp.classList.add('filled');
+  }
+}
+
 /* 确认当前格并前进：先校验（补小数/格式化日期），跳转规则优先，
    否则严格按问卷顺序到下一格（与原版 EpiData 一致，已有数据的格子不跳过） */
 function advance(name) {
@@ -477,6 +1042,11 @@ function advance(name) {
   const inp = inputs[name];
   if (!f || !inp) return;
   let v = inp.value.trim();
+  // MISSINGVALUE：录入 "-" 离开字段时替换为第一缺失值
+  if (v === '-' && f.missingvalues && f.missingvalues.length) {
+    v = f.missingvalues[0];
+    inp.value = v;
+  }
   if (!v && f.mustenter) {
     setBad(inp, '必填字段，不能为空'); beep();
     alertMsg(`「${f.name}」${f.text ? ' ' + f.text : ''} 为必填字段（MUSTENTER）`,
@@ -494,7 +1064,7 @@ function advance(name) {
              esc(msg) + (f.rng ? `\n允许范围：${f.rng[0]} ~ ${f.rng[1]}` : ''), inp);
     return;
   }
-  if (v && f.kind === '#' && f.typecode !== 19) {
+  if (v && f.kind === '#' && f.tc !== 19) {
     if (f.decimals > 0) {
       v = padDecimals(v, f.decimals);
     } else {
@@ -503,33 +1073,69 @@ function advance(name) {
     if (inp.value !== v) inp.value = v;      // 跳转前规范化显示（同原版浮点/整数字段）
   }
   clearBad(inp);
+  let actTarget = null;
+  chkEntryCheckError = '';
+  if (f.actions && f.actions.length) actTarget = runChkActions(f.actions, name);
+  else applyAfterEntryLets(name);
+  chkReportEvalErrors();
+  if (chkEntryCheckError) {
+    setBad(inp, chkEntryCheckError); beep();
+    toast(chkEntryCheckError, true, 6000);
+    return;
+  }
 
   const i = order.indexOf(name);
-  let next = -1;
-  if (f.jumps && f.jumps[v] !== undefined) {
-    const t = order.indexOf(f.jumps[v]);
-    if (t >= 0) next = t;
+  let next = -1, jumpFill = '';
+  if (actTarget !== null) {
+    next = chkTargetIndex(actTarget, i);
+  } else if (f.autojump) {
+    next = chkTargetIndex(f.autojump, i);
+    jumpFill = f.jumps_reset || '';
+  } else if (f.jumps && f.jumps[v] !== undefined) {
+    next = chkTargetIndex(f.jumps[v], i);
+    jumpFill = f.jumps_reset || '';
   } else if (f.gotos && f.gotos.length) {
     for (const g of f.gotos) {
       if (val(g[0]) === g[1]) {
-        const t = order.indexOf(g[2]);
-        if (t >= 0) next = t;
-        break;
+        next = chkTargetIndex(g[2], i);
+        if (next >= 0) break;
       }
     }
   }
+  // AFTER ENTRY 的裸 GOTO：无条件跳转（JUMPS / 条件 GOTO 未命中时才生效）
+  if (next < 0 && f.after_goto) next = chkTargetIndex(f.after_goto, i);
   if (next < 0) next = i + 1;                          // 顺序前进（不跳过已填格子）
-  if (next >= order.length || next < 0) { askSave(); return; }
+  if (next === -2 || next >= order.length) { askSave(); return; }
+  if (jumpFill) applyJumpReset(i, next, jumpFill);
   focusField(order[next], true);
   sendDraft();
 }
 
-function focusField(name, track = false) {
+function focusField(name, track = false, visited = null) {
   const inp = inputs[name];
   if (!inp) return;
+  // BEFORE ENTRY 互跳时防止无限递归：同一字段只执行一次动作，但仍要完成聚焦
+  const seen = visited || new Set();
+  const already = seen.has(name);
+  seen.add(name);
+  // BEFORE ENTRY：进入字段时执行赋值/跳转（官方 CHECK 语义）
+  const f = fieldsByName[name];
+  const i = order.indexOf(name);
+  if (!already && f && f.before_actions && f.before_actions.length) {
+    chkEntryCheckError = '';
+    const target = runChkActions(f.before_actions, name);
+    chkReportEvalErrors();
+    if (chkEntryCheckError) { toast(chkEntryCheckError, true, 6000); return; }
+    if (target !== null) {
+      const t = chkTargetIndex(target, i);
+      if (t >= 0 && t < order.length && t !== i) {
+        focusField(order[t], track, seen);
+        return;
+      }
+    }
+  }
   inp.scrollIntoView({behavior: 'smooth', block: 'center'});
   inp.focus();
-  const i = order.indexOf(name);
   $('#entry-progress').textContent = `字段 ${i + 1} / ${order.length}`;
   markToc(name);
   updateFieldStatus(fieldsByName[name]);
@@ -566,6 +1172,7 @@ async function resumeDraft() {
     refreshFilled();
     updateEntryUI();
     focusField(inputs[entry.cursor] ? entry.cursor : order[0], true);
+    resetCurrentTiming();              // 续录也从 00:00 开始新的一份
   } else {
     await api('/api/draft/clear', {}).catch(() => {});
     startNew();
@@ -596,6 +1203,7 @@ function updateEntryUI() {
 function startNew() {
   entry = {active: true, values: null, cursor: ''};
   viewing = null;
+  chkVars = {};                        // DEFINE/LET 临时变量每条记录重置
   order.forEach(n => { inputs[n].value = ''; });
   const last = P.records[P.records.length - 1];
   if (last) {
@@ -606,6 +1214,7 @@ function startNew() {
   refreshFilled();
   updateEntryUI();
   focusField(order[0], true);
+  resetCurrentTiming();                // 每份新问卷从 00:00 重新计时
 }
 
 /* 离开录入视图前快照草稿（只在自己正处于录入视图时快照） */
@@ -636,6 +1245,7 @@ function returnToEntry() {
   refreshFilled();
   updateEntryUI();
   focusField(inputs[entry.cursor] ? entry.cursor : order[0], true);
+  noteActivity();                      // 回到正在录入的那份：继续计时
 }
 
 function collectValues() {
@@ -716,7 +1326,7 @@ async function askSave() {
 }
 
 async function save() {
-  const values = collectValues();
+  let values = collectValues();
   const errs = [];
   P.fields.forEach(f => {
     // 必填已由录入时的当场拦截保证；跳转合法跳过的必填允许留空（与 EpiData 一致）
@@ -729,6 +1339,21 @@ async function save() {
     setBad(inputs[e0.f.name], e0.msg); beep();
     await alertMsg(`还有 ${errs.length} 个字段未通过校验，不能保存`,
                    esc(list) + (errs.length > 5 ? `\n… 共 ${errs.length} 项` : ''), inputs[e0.f.name]);
+    return;
+  }
+  // BEFORE RECORD 赋值/清除后重新收集值
+  if (P.before_record_actions && P.before_record_actions.length) {
+    runChkActions(P.before_record_actions, order[0]);
+    values = collectValues();
+  }
+  // AFTER RECORD 的记录级检查：CHECK 不通过或 GOTO 都阻止保存
+  const recCheck = runRecordActions(P.after_record_actions);
+  chkReportEvalErrors();
+  if (recCheck.failed || recCheck.goto !== null) {
+    beep();
+    toast(recCheck.message || '记录级检查未通过，已停止保存', true, 6000);
+    const t = recCheck.goto ? chkTargetIndex(recCheck.goto, 0) : -1;
+    if (t >= 0 && t < order.length) focusField(order[t], true);
     return;
   }
   const isEntrying = entry.active && viewing === null;
