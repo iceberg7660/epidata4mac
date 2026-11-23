@@ -9,6 +9,7 @@ __pycache__/
 .last.json
 *.bak
 *.draft.json
+*.timing.json
 
 # 导出产物（若导出到项目目录内）
 *.xlsx

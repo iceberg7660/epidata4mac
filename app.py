@@ -332,6 +332,7 @@ def project_payload() -> dict:
         'lines': qes.segments() if qes else None,
         'records': [[rec.records[i][n] for n in order] for i in range(len(rec.records))],
         'draft': read_draft(),
+        'timings': read_timings(),
         'ignore_missing': bool(chk and chk.ignore_missing),
         'before_record_actions': _dump_actions(chk.before_record_actions) if chk else [],
         'after_record_actions': _dump_actions(chk.after_record_actions) if chk else [],
@@ -369,13 +370,16 @@ def read_draft() -> dict | None:
     return None
 
 
-def write_draft(values: dict, cursor: str) -> None:
+def write_draft(values: dict, cursor: str, timing_ms: int = 0,
+                timing_id: str = '') -> None:
     rec: RecFile = STATE['rec']
     clean = {}
     for f in rec.fields:
         if f.name in values:
             clean[f.name] = rec.encode_value(f, str(values[f.name])).decode('gbk').strip()
-    json.dump({'version': 1, 'cursor': cursor, 'values': clean,
+    json.dump({'version': 2, 'cursor': cursor, 'values': clean,
+               'timing_ms': max(0, int(timing_ms or 0)),
+               'timing_id': str(timing_id or ''),
                'rec_path': STATE['path'],
                'saved_at': time.strftime('%Y-%m-%d %H:%M:%S')},
               open(draft_path(), 'w', encoding='utf-8'), ensure_ascii=False)
@@ -386,6 +390,52 @@ def clear_draft() -> None:
         os.unlink(draft_path())
     except OSError:
         pass
+
+
+# ---------- 录入用时（伴生文件 <rec>.timing.json，只统计本应用录入过的记录） ----------
+
+def timing_path() -> str:
+    return STATE['path'] + '.timing.json'
+
+
+def read_timings() -> dict:
+    try:
+        d = json.load(open(timing_path(), encoding='utf-8'))
+        out: dict[str, int] = {}
+        if isinstance(d, dict):
+            for k, v in d.items():
+                try:
+                    out[str(int(k))] = max(0, int(v))
+                except (ValueError, TypeError):
+                    continue
+        return out
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def write_timing(index: int, ms: int) -> None:
+    d = read_timings()
+    d[str(int(index))] = max(0, int(ms))
+    tmp = timing_path() + '.tmp'
+    json.dump(d, open(tmp, 'w', encoding='utf-8'), ensure_ascii=False)
+    os.replace(tmp, timing_path())
+
+
+def delete_timing(index: int) -> None:
+    d = read_timings()
+    d.pop(str(int(index)), None)
+    tmp = timing_path() + '.tmp'
+    json.dump(d, open(tmp, 'w', encoding='utf-8'), ensure_ascii=False)
+    os.replace(tmp, timing_path())
+
+
+def shift_timings_after_delete(index: int) -> None:
+    d = read_timings()
+    d.pop(str(index), None)
+    out = {str(int(k) - 1 if int(k) > index else int(k)): v for k, v in d.items()}
+    tmp = timing_path() + '.tmp'
+    json.dump(out, open(tmp, 'w', encoding='utf-8'), ensure_ascii=False)
+    os.replace(tmp, timing_path())
 
 
 # ---------- EpiData 式 text 导出（记录范围 / 字段选择 / 过滤器 / 选项） ----------
@@ -609,7 +659,7 @@ class Handler(BaseHTTPRequestHandler):
                 body = {}
             # 写操作的项目一致性守卫：防止浏览器页面与服务端打开的文件不一致时写错文件
             if u.path in ('/api/save', '/api/draft', '/api/delete', '/api/export-text',
-                          '/api/normalize') and STATE['rec']:
+                          '/api/normalize', '/api/timing/delete') and STATE['rec']:
                 want = body.get('path')
                 if want and want != STATE['path']:
                     return self._json({
@@ -682,12 +732,17 @@ class Handler(BaseHTTPRequestHandler):
                 rec.save(records=records)
                 rec.records = records
                 clear_draft()          # 整份问卷已写入 .rec，草稿完成使命
-                return self._json({'ok': True, 'index': idx, 'nrecords': len(records)})
+                ms = int(body.get('timing_ms', 0) or 0)
+                if ms > 0:             # 0ms 视为本应用未录入过，不建立时间记录
+                    write_timing(idx, ms)
+                return self._json({'ok': True, 'index': idx, 'nrecords': len(records),
+                                   'timings': read_timings()})
 
             if u.path == '/api/draft':
                 if not STATE['rec']:
                     return self._json({'error': '尚未打开数据文件'}, 400)
-                write_draft(body.get('values', {}), body.get('cursor', ''))
+                write_draft(body.get('values', {}), body.get('cursor', ''),
+                            body.get('timing_ms', 0), body.get('timing_id', ''))
                 return self._json({'ok': True})
 
             if u.path == '/api/draft/clear':
@@ -816,6 +871,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({'ok': True, 'applied': len(changes),
                                    'problems': len(problems), 'nrecords': len(rec.records)})
 
+            if u.path == '/api/timing/delete':
+                idx = int(body.get('index', -1))
+                delete_timing(idx)
+                return self._json({'ok': True, 'index': idx, 'timings': read_timings()})
+
             if u.path == '/api/delete':
                 if not STATE['rec']:
                     return self._json({'error': '尚未打开数据文件'}, 400)
@@ -828,8 +888,9 @@ class Handler(BaseHTTPRequestHandler):
                 shutil.copy2(STATE['path'], bak)      # 删除前的完整备份
                 rec.records.pop(idx)
                 rec.save(records=rec.records, backup=False)
+                shift_timings_after_delete(idx)
                 return self._json({'ok': True, 'nrecords': len(rec.records),
-                                   'backup': bak})
+                                   'backup': bak, 'timings': read_timings()})
 
             return self._json({'error': 'not found'}, 404)
         except RecError as e:

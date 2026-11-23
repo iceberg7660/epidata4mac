@@ -139,14 +139,17 @@ function alertMsg(title, html, refocusInput) {
     });
 }
 
-/* ---------------- 录入计时（纯内存，不写入 .rec） ----------------
+/* ---------------- 录入计时（写入伴生 .timing.json，不写入 .rec） ----------------
  * 当前用时：仅「正在录入草稿 + 停留在录入页 + 无弹窗」时按真实经过时间累加；
  * 无操作 5 秒 / 切面板 / 查看历史记录 / 弹窗 → 暂停，有操作或回到录入页后继续；
- * 平均录入时间 = 本次会话累计有效用时 ÷ 当前 .rec 记录总数（含历史记录）。
+ * 平均录入时间 = 本应用录入过的问卷累计有效用时 ÷ 有录入时间记录的问卷数，
+ * 原版 EpiData 录入、没有时间记录的旧问卷不计入分母。
+ * 返回修改已有问卷时从该问卷已存用时继续累加，不归零。
  */
 const IDLE_MS = 5000;
 const timing = {
-  path: null, currentMs: 0, sessionMs: 0,
+  path: null, currentMs: 0, records: {}, key: null,
+  draftKey: null, draftMs: 0,
   lastTs: performance.now(), idle: false, idleTimer: null,
 };
 
@@ -158,7 +161,8 @@ function fmtDur(ms) {
            : `${pad(Math.floor(s / 60))}:${pad(s % 60)}`;
 }
 function timingActive() {
-  return !!P && entry.active && viewing === null && !modalOpen &&
+  // 新录入草稿与返回修改已有记录都计时；切到其它面板/弹窗/页面隐藏才暂停
+  return !!P && (entry.active || viewing !== null) && !modalOpen &&
          !document.hidden && !$('#panel-entry').hidden;
 }
 function renderTiming() {
@@ -166,10 +170,13 @@ function renderTiming() {
   $('#timer-value').textContent = fmtDur(timing.currentMs);
   $('#timer-state').textContent = !timingActive() ? '已暂停' : (timing.idle ? '已暂停（5 秒无操作）' : '');
   $('#timer-main').classList.toggle('paused', !active);
-  const n = P ? P.records.length : 0;
+  const vals = Object.values(timing.records)
+    .filter(v => typeof v === 'number' && Number.isFinite(v) && v >= 0);
+  const n = vals.length;
+  const total = vals.reduce((a, b) => a + b, 0);
   $('#timer-avg').textContent = n
-    ? `平均录入时间 ${fmtDur(timing.sessionMs / n)} / 份（本文件 ${n} 份记录）`
-    : '平均录入时间 — / 份（本文件暂无记录）';
+    ? `平均录入时间 ${fmtDur(total / n)} / 份（本应用已录入 ${n} 份）`
+    : '平均录入时间 — / 份（本应用暂无录入时间记录）';
 }
 function noteActivity() {
   if (!timingActive()) return;
@@ -178,14 +185,38 @@ function noteActivity() {
   timing.idleTimer = setTimeout(() => { timing.idle = true; renderTiming(); }, IDLE_MS);
   renderTiming();
 }
-function resetCurrentTiming() {
-  timing.currentMs = 0;
+function newDraftTimingId() {
+  return 'draft:' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+}
+function persistCurrentTiming() {
+  // 只有已保存过用时的记录才实时更新；草稿/无时间记录的旧问卷保存前不进分母
+  if (timing.key && Object.prototype.hasOwnProperty.call(timing.records, timing.key))
+    timing.records[timing.key] = timing.currentMs;
+}
+function setTimingFor(key, ms) {
+  timing.key = key;
+  timing.currentMs = Math.max(0, Number(ms) || 0);
+  persistCurrentTiming();
   noteActivity();
 }
+function beginNewDraftTiming() {
+  const key = newDraftTimingId();
+  timing.draftKey = key;
+  timing.draftMs = 0;
+  setTimingFor(key, 0);
+}
+function beginEditTiming(i) {
+  const key = String(i);
+  setTimingFor(key, timing.records[key] || 0);
+}
+function resetCurrentTiming() { beginNewDraftTiming(); }
 function resetTimingForRec(path) {
   timing.path = path;
+  timing.records = { ...((P && P.timings) || {}) };
+  timing.key = null;
+  timing.draftKey = null;
+  timing.draftMs = 0;
   timing.currentMs = 0;
-  timing.sessionMs = 0;
   timing.idle = false;
   clearTimeout(timing.idleTimer);
   renderTiming();
@@ -197,7 +228,7 @@ setInterval(() => {
   const now = performance.now();
   if (timingActive() && !timing.idle) {
     timing.currentMs += now - timing.lastTs;
-    timing.sessionMs += now - timing.lastTs;
+    persistCurrentTiming();
   }
   timing.lastTs = now;
   renderTiming();
@@ -1150,7 +1181,8 @@ function sendDraft() {
   clearTimeout(draftTimer);
   draftTimer = setTimeout(() => {
     if (!P || !entry.active) return;
-    api('/api/draft', {path: P.path, values: collectValues(), cursor: entry.cursor}).catch(() => {});
+    api('/api/draft', {path: P.path, values: collectValues(), cursor: entry.cursor,
+                       timing_ms: timing.currentMs, timing_id: timing.key}).catch(() => {});
   }, 150);
 }
 
@@ -1171,8 +1203,11 @@ async function resumeDraft() {
     P.fields.forEach(f => { inputs[f.name].value = vals[f.name] || ''; });
     refreshFilled();
     updateEntryUI();
+    setTimingFor(d.timing_id || newDraftTimingId(), d.timing_ms || 0);
+    timing.draftKey = timing.key;
+    timing.draftMs = timing.currentMs;
+    noteActivity();                    // 草稿已有时长则从该时长继续
     focusField(inputs[entry.cursor] ? entry.cursor : order[0], true);
-    resetCurrentTiming();              // 续录也从 00:00 开始新的一份
   } else {
     await api('/api/draft/clear', {}).catch(() => {});
     startNew();
@@ -1221,6 +1256,8 @@ function startNew() {
 function snapshotEntry() {
   if (entry.active && viewing === null) {
     entry.values = collectValues();
+    timing.draftKey = timing.key;
+    timing.draftMs = timing.currentMs;
   }
 }
 
@@ -1232,6 +1269,7 @@ function viewRecord(i) {
   refreshFilled();
   updateEntryUI();
   showPanel('entry');
+  beginEditTiming(i);                  // 从该记录已存用时继续，不归零
   focusField(order[0]);
 }
 
@@ -1244,8 +1282,9 @@ function returnToEntry() {
   }
   refreshFilled();
   updateEntryUI();
+  setTimingFor(timing.draftKey || newDraftTimingId(), timing.draftMs || 0);
+  noteActivity();                      // 回到正在录入的那份：从草稿已存用时继续
   focusField(inputs[entry.cursor] ? entry.cursor : order[0], true);
-  noteActivity();                      // 回到正在录入的那份：继续计时
 }
 
 function collectValues() {
@@ -1298,6 +1337,12 @@ $('#btn-del-rec').onclick = async () => {
   try {
     const r = await api('/api/delete', {path: P.path, index: idx});
     P.records.splice(idx, 1);
+    if (r.timings) {
+      timing.records = { ...r.timings };
+      timing.key = viewing !== null ? String(viewing) : timing.key;
+      timing.currentMs = timing.key ? (timing.records[timing.key] || 0) : timing.currentMs;
+      renderTiming();
+    }
     toast(`记录 #${idx + 1} 已删除，备份：${r.backup.split('/').pop()}`);
     renderBrowse();
     if (!P.records.length) {
@@ -1358,8 +1403,17 @@ async function save() {
   }
   const isEntrying = entry.active && viewing === null;
   try {
-    const r = await api('/api/save', {path: P.path, index: viewing !== null ? viewing : null, values});
+    const r = await api('/api/save', {path: P.path, index: viewing !== null ? viewing : null,
+                                      values, timing_ms: timing.currentMs});
     P.records[r.index] = order.map(n => values[n]);
+    // 用时从草稿键转存到正式记录号；删除后记录号平移由服务端返回权威表
+    delete timing.records[timing.key];
+    timing.records = r.timings ? { ...r.timings } : timing.records;
+    if (!r.timings) timing.records[String(r.index)] = timing.currentMs;
+    timing.key = String(r.index);
+    timing.draftKey = null;
+    timing.draftMs = 0;
+    renderTiming();
     if (isEntrying) {
       toast(`第 ${r.index + 1} 条已写入 .rec，继续录下一条`);
       startNew();                       // 服务器已清除草稿文件
@@ -1389,6 +1443,23 @@ document.addEventListener('keydown', e => {
 /* ---------------- 浏览 ---------------- */
 
 /* 浏览 = Excel 式全字段表格：全部记录 × 全部字段，表头行/行号列冻结，隔行底纹 */
+function timingCellHtml(i) {
+  const ms = timing.records[String(i)];
+  if (typeof ms !== 'number' || !Number.isFinite(ms))
+    return '<td class="g-time"><span class="time-none">—</span></td>';
+  return `<td class="g-time"><span class="time-chip">${fmtDur(ms)}</span>` +
+         `<button class="time-del" data-i="${i}" title="删除此记录的录入时间（平均分母同步减少）">×</button></td>`;
+}
+async function deleteRecordTiming(i) {
+  try {
+    const r = await api('/api/timing/delete', {path: P.path, index: i});
+    timing.records = { ...r.timings };
+    if (String(i) === timing.key) timing.currentMs = 0;
+    renderTiming();
+    renderBrowse();
+    toast(`已删除记录 #${i + 1} 的录入时间`);
+  } catch (e) { toast(e.message, true); }
+}
 function renderBrowse() {
   const q = $('#filter').value.trim().toLowerCase();
   const idxs = P.records
@@ -1396,7 +1467,8 @@ function renderBrowse() {
     .filter(x => !q || x.r.join('\u0001').toLowerCase().includes(q))
     .slice(0, 300);
   // 表头：字段名（同录入页题号芯片）+ 中文题目（同导出 Excel 的前两行）
-  $('#rec-head').innerHTML = '<th class="g-idx">#</th>' +
+  // 最左侧独立的「录入时间」列：样式与右侧数据列不同，只统计本应用录入过的记录
+  $('#rec-head').innerHTML = '<th class="g-time">录入时间</th><th class="g-idx">#</th>' +
     P.fields.map(f => `<th data-fname="${esc(f.name)}" data-ftext="${esc(f.text || '')}">${esc(f.name)}</th>`).join('');
   // 列头悬停 → 自绘浮层显示题目全文（原生 title 在部分内嵌浏览器中不显示）
   $('#rec-head').querySelectorAll('th[data-fname]').forEach(th => {
@@ -1407,7 +1479,7 @@ function renderBrowse() {
     th.onmouseleave = hideTip;
   });
   $('#rec-body').innerHTML = idxs.map(x =>
-    `<tr data-i="${x.i}"><td class="g-idx">${x.i + 1}</td>` +
+    `<tr data-i="${x.i}">${timingCellHtml(x.i)}<td class="g-idx">${x.i + 1}</td>` +
     P.fields.map((f, k) =>
       `<td${x.r[k] ? '' : ' class="g-empty"'}>${esc(x.r[k])}</td>`).join('') +
     `</tr>`).join('');
@@ -1416,6 +1488,9 @@ function renderBrowse() {
     (idxs.length >= 300 ? ' · 最多显示 300 条，可用过滤缩小范围' : '');
   $('#rec-body').querySelectorAll('tr[data-i]').forEach(tr => {
     tr.ondblclick = () => viewRecord(+tr.dataset.i);
+  });
+  $('#rec-body').querySelectorAll('.time-del').forEach(btn => {
+    btn.onclick = ev => { ev.stopPropagation(); deleteRecordTiming(+btn.dataset.i); };
   });
 }
 /* 历史数据规范化：先检查报告，用户确认后执行（有问题保持原值并报告） */

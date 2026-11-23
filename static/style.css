@@ -144,8 +144,21 @@ main { padding: 18px; max-width: 1200px; margin: 0 auto; }
 #rec-table.grid th {
   position: sticky; top: 0; z-index: 2; background: #dbe5f1;
 }
+/* 左侧「录入时间」列：暖色标签风格，与右侧冷色数据列明显区分 */
+#rec-table.grid th.g-time, #rec-table.grid td.g-time {
+  position: sticky; left: 0; min-width: 112px; width: 112px;
+  border-right: 2px solid #f4c979; padding: 4px 8px;
+}
+#rec-table.grid th.g-time { z-index: 5; background: #fde9c8; color: #92400e; }
+#rec-table.grid td.g-time { z-index: 2; background: #fffaf0; }
+.time-chip { font-family: Menlo, monospace; font-size: 12px; font-weight: 700; color: #b45309;
+  background: #fef3c7; border: 1px solid #fcd34d; border-radius: 999px; padding: 1px 7px; }
+.time-none { color: #d1d5db; }
+.time-del { margin-left: 5px; border: 0; background: transparent; color: #b45309;
+  font-size: 14px; line-height: 1; cursor: pointer; padding: 0 3px; border-radius: 4px; }
+.time-del:hover { background: #fee2e2; color: #b91c1c; }
 #rec-table.grid td.g-idx, #rec-table.grid th.g-idx {
-  position: sticky; left: 0; font-weight: 600;
+  position: sticky; left: 112px; font-weight: 600;
 }
 #rec-table.grid th.g-idx { z-index: 3; }
 #rec-table.grid td.g-empty { color: #cbd5e1; }
@@ -153,8 +166,10 @@ main { padding: 18px; max-width: 1200px; margin: 0 auto; }
 #rec-table.grid tbody tr:nth-child(odd) td { background: #fff; }
 #rec-table.grid tbody tr:nth-child(even) td { background: #f2f6fb; }
 #rec-table.grid tbody tr:nth-child(even) td.g-idx { background: #e8eef7; }
+#rec-table.grid tbody tr:nth-child(even) td.g-time { background: #fdf6e6; }
 #rec-table.grid tbody tr:hover td { background: #fff7d6; }
 #rec-table.grid tbody tr:hover td.g-idx { background: #f1f5f9; }
+#rec-table.grid tbody tr:hover td.g-time { background: #ffedc4; }
 #filter { padding: 6px 10px; border: 1px solid #cbd5e1; border-radius: 6px; width: 260px; }
 
 .export-cards { display: flex; gap: 14px; }
